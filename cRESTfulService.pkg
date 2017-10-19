@@ -1,0 +1,459 @@
+//==============================================================================
+// Class: cRESTfulService
+//    This will, along with the appropriate ASP file and IIS settings (see below) 
+//    allow the creation of RESTful JSON web services in a DataFlex WebApp.
+//    Objects based on it should have the extension .wo and be USEd in the
+//    WebApp object of a WebApp.src program.
+//
+// Full documentation at: https://docs.google.com/document/d/1VZWsVO6xCJjg2mWsdB_nwmKMtwTKu3mIunuFYicoA1Q/edit?usp=sharing
+//==============================================================================
+// Licence:
+//
+// Copyright (c) 2017 Unicorn InterGlobal Limited
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+//==============================================================================
+// The ASP:
+//
+//  <%
+//    Dim sData, iLen
+//    iLen = Request.TotalBytes
+//    If (iLen > 0) Then sData = {YourObjectName}.UTF8ToString(Request.BinaryRead(iLen))
+//    Response.BinaryWrite {YourObjectName}.StringToUTF8 ({YourObjectName}.call("GET_ProcessCall", sData, iLen))
+//  %>
+//
+// Notes: Replace {YourObjectName} with, err... your web object's name!
+//        Call it something sensible - I use REST.asp.
+//==============================================================================
+// IIS changes:
+//
+//     1. In URLRewite (may need to install) Add Server Variable ORIGINAL_REQUEST
+//        for your virtual directory
+//     2. Add a rewrite Rule for all calls (use wildcards and "*") for your 
+//        virtual directory to be directed to your ASP file (see above)
+//     3. In the "Server Variables" section, Add the server variable:
+//        Name (select from drop-down): ORIGINAL_REQUEST and "Value" the Capture
+//        Group: "{R:0}" (without the quotes)
+//     4. In Handler Mappings, locate ASPClassic, open and click 
+//        "Request Restrictions" then in the "Verbs" tab change "One of the
+//        folling verbs" to: "GET,HEAD,POST,PUT,PATCH,DELETE" (without the quotes)
+//==============================================================================
+// Version: 1.0
+//
+// Change log:
+// Date         Author   Remarks
+// ==========   ======== =======================================================
+// 23/06/2017   MJP      Changed return mechanism to use Harm's variant string
+//                       approach
+// 01/06/2017   MJP      Created
+//==============================================================================
+
+Use cWebBusinessProcess.pkg
+Use cJsonObject.pkg
+Use cCharTranslate.pkg
+
+// Used for returning JSON errors - can also be used for returning an "OK" response
+Struct tErrorResponse
+    Integer code
+    String  message
+    String  data
+End_Struct
+
+// Used for returning DataFlex errors arising during processing in the returned JSON
+Struct tRestError
+    Integer num
+    String  msg
+    Integer line
+    Integer table
+    Integer col
+End_Struct
+
+// The JSONRPC standard error codes (see: http://www.jsonrpc.org/specification)
+//-32700	Parse error	          Invalid JSON was received by the server. An error occurred on the server while parsing the JSON text.
+//-32600	Invalid Request       The JSON sent is not a valid Request object.
+//-32601	Method not found      The method does not exist / is not available.
+//-32602	Invalid params        Invalid method parameter(s).
+//-32603	Internal error        Internal JSON-RPC error.
+//-32000 to 
+//   -32099 Server error          Reserved for implementation-defined server-errors.
+
+Enum_List
+    // Our own errors:
+    Define C_restOK        for 0      // No error at all!  :-)
+    Define C_restDataError for -32099 // JSONRPC says -32099 to -32000 are ours
+    Define C_restResourceNotFound
+    Define C_restUpdateFailed
+    Define C_restLast  // If extending these errors, start your
+                       // Enum_List with:
+                       // Define C_{whateverYouWant} for C_restLast
+    
+    // Pre-defined JSONRPC errors:
+    Define C_restDataParseError     for -32700
+    Define C_restUnrecognisedMethod for -32601
+    Define C_restInvalidParams      for -32602
+End_Enum_List
+
+Class cRESTfulService is a cWebBusinessProcess
+    
+    // Don't mess with this - write your own! ;-)
+    Procedure Construct_Object
+        Forward Send Construct_Object
+        
+        // Private
+        Property Address  paData
+        Property Integer  piDataLen
+        Property String   psRequest
+        Property String[] pasRequestParts
+        
+        // Public
+        Property String   psVerb
+        Property Handle   phoJsonData
+        Property Boolean  pbDFErrsToJson True  // True will queue DataFlex errors
+                                               // and add them to the returned JSON
+        Object oTrans is a cCharTranslate
+        End_Object
+        
+    End_Procedure
+    
+//==============================================================================
+// Functions we expect that an object or sub-class will call
+//==============================================================================
+    
+    Function QueryValue String sParam Returns String
+        Function_Return (HtmlQueryString(ghInetSession, sParam))
+    End_Function
+    
+    Function HttpHeaderValue String sHeader Returns String
+        Function_Return (ServerVariable(Self, ("HTTP_" + sHeader)))
+    End_Function
+    
+    // Function RequestPart
+    // ====================
+    // Will return the zero-based part of the original call, after the virtual
+    // directory name, so if the call was:
+    //
+    //     http://host.domain.com/MyService/Widgets/Flange/0732167
+    //
+    //     Get RequestPart 0 would return "Widgets"
+    //     Get RequestPart 1 would return "Flange"
+    //     Get RequestPart 2 would return "0732167"
+    //
+    // And so on.
+    Function RequestPart Integer iPart Returns String
+        String[] asReq
+        
+        Get pasRequestParts to asReq
+        
+        If (SizeOfArray(asReq) > iPart) Begin
+            Function_Return asReq[iPart]
+        End
+        Else Begin
+            Function_Return ""
+        End
+        
+    End_Function
+    
+    // Function ReturnJson
+    // ===================
+    // In most circumstances your business methods should return a call to this
+    // passing a struct variable.
+    //
+    //   Example:
+    //       ...
+    //       Function_Return (ReturnJson(Self, tMyResponse))
+    //      
+    // The other possibility is to return a call to ReturnError (see below),
+    // which will then call ReturnJson with an error struct.
+    Function ReturnJson Variant vData Returns Variant
+        Variant vResponse
+        Handle  hoJson hoErrs
+        Boolean bOK
+        UChar[] ucaResp
+        Integer i iLast iErrs
+        tRestError[] tErrs
+        
+        // First tidy up
+        Get phoJsonData to hoJson
+        
+        If hoJson Begin
+            Send Destroy of hoJson
+            Set phoJsonData to 0
+        End
+        
+        Get Create (RefClass(cJsonObject)) to hoJson
+        Send DataTypeToJson of hoJson vData
+
+        If (pbDFErrsToJson(Self)) Begin
+            
+            // Stop the error queue and get the queued errors into a JSON object
+            Send ErrorQueueEnd
+            Get Create (RefClass(cJsonObject)) to hoErrs
+            Get ErrorCount to iErrs
+            
+            If iErrs Begin
+                Move (iErrs - 1) to iLast
+    
+                For i from 0 to iLast
+                    Get Value of (oErrorNumber(ghoWebErrorHandler)) i to tErrs[i].num
+                    Get Value of (oErrorText(ghoWebErrorHandler))   i to tErrs[i].msg
+                    Get Value of (oLineNr(ghoWebErrorHandler))      i to tErrs[i].line
+                    Get Value of (oFileNr(ghoWebErrorHandler))      i to tErrs[i].table
+                    Get Value of (oFieldNr(ghoWebErrorHandler))     i to tErrs[i].col
+                Loop
+    
+                Send DataTypeToJson of hoErrs tErrs
+            End
+                    
+            If iErrs Begin
+                // If errors exist, append them to the returned JSON
+                Send SetMember of hoJson "errors" hoErrs
+            End
+        
+            Send Destroy of hoErrs
+        End
+        
+        // Serialise the JSON and get rid of the object
+        Get StringifyUtf8   of hoJson to ucaResp
+        Move (VariantStrFromUCharArray(oTrans, ucaResp, CP_UTF8)) to vResponse
+        Send Destroy of hoJson
+        
+        Send AddHttpResponseHeader "Content-type" "application/json"
+
+        Function_Return vResponse
+    End_Function
+
+    // Function ReturnError
+    // ====================
+    // You can return an error response from your business methods by returning
+    // a call to this with three arguments (The third may be an empty string if
+    // the first two provide sufficient information).
+    //
+    //   Example:
+    //     ...
+    //     Function_Return (ReturnError(Self, C_SomeIntegerErrorConstant, ;
+    //                                  "Oops! That was bad!", ;
+    //                                  "The call must define which flange-wangle it is addressing"
+    //
+    Function ReturnError Integer iErr String sMsg String sData Returns Variant
+        tErrorResponse tErr
+        
+        Move iErr   to tErr.code
+        Move sMsg   to tErr.message
+        Move sData  to tErr.data
+        
+        Function_Return (ReturnJson(Self, tErr))
+    End_Function
+
+//==============================================================================
+// Functions we expect an object or sub-class to override
+//==============================================================================
+
+    // Function RouteCall
+    // ==================
+    // REQUIRED to be overridden, or nothing will work (except the error!).
+    //
+    // It should return a call to the appropriate business method based on the
+    // call made and the verb used (and possibly query string parameter values
+    // or HTTP header values, although such are non-standard).
+    //
+    // Example:
+    //
+    //      Function RouteCall Returns Variant
+    //          String sVerb sRequest
+    //
+    //          Get psVerb        to sVerb
+    //          Get RequestPart 0 to sRequest
+    //
+    //          Case Begin
+    //              Case ((sVerb = "GET") and (sRequest = "LISTWIDGETS"))
+    //                  Function_Return (ListWidgets(Self))
+    //                  Case Break
+    //              Case ....
+    //
+    Function RouteCall Returns Variant
+        Function_Return (ReturnError(Self, C_restUnrecognisedMethod, ;
+                         "Method not found", ;
+                         "The method called does not exist or is not available.\nRouteCall has not been overridden in the web object."))
+    End_Function
+    
+    // Function BeforeProcessing
+    // =========================
+    // Designed to be overridden if required - returning False should also 
+    // involve populating the passed tErr ByRef struct to provide information
+    // about WHY you are returning False, which will abort processing and return
+    // your error information as JSON.
+    //
+    // This is essentially a hook that you can override to inject your own
+    // processing into the flow BEFORE any JSON content in the HTTP body of a
+    // request is parsed and control is passed on to RoutCall.
+    // 
+    // An example of such usage might be to check credential information passed
+    // in the HTTP headers or query string parameters, returning False if the
+    // credentials were invalid and stating that fact in the ByRef tErr struct,
+    // the content of which will then be returned as JSON to the caller.
+    //
+    // Everything except phoJsonData will be populated by this point.
+    Function BeforeProcessing tErrorResponse ByRef tErr Returns Boolean
+        Function_Return True
+    End_Function
+    
+//==============================================================================
+// Functions we DO NOT expect you to deal with in an object or sub-class
+//==============================================================================
+
+    Function ParseRequest Returns String[]
+        Function_Return (StrSplitToArray(Uppercase(psRequest(Self)), "/"))
+    End_Function
+
+    // Just lets us return a JSON object with error information from the
+    // ParseJson method
+    Function JsonError Integer iErr String sMsg String sData Returns Handle
+        tErrorResponse tErr
+        Handle hoErr
+        
+        Move iErr   to tErr.code
+        Move sMsg   to tErr.message
+        Move sData  to tErr.data
+        
+        Get Create (RefClass(cJsonObject)) to hoErr
+        Send DataTypeToJson of hoErr tErr
+        
+        Function_Return hoErr
+    End_Function
+    
+    // This will handle parsing the HTTP Body JSON content into a JSON object
+    Function ParseJson Boolean ByRef bOK Returns Handle
+        Address pData pConv
+        Integer iLen
+        UChar[] ucaData
+        Handle  hoJson
+        Boolean bWorked
+        
+        Move False      to bOK
+        Get paData      to pData
+        
+        // Translate the data into OEM, move to UChar array, free memory (twice!)
+        Move (Utf8FromBuffer(oTrans, pData, CP_OEMCP))  to pConv
+        Move (Free(pData))                              to bWorked
+        Move (CStringLength(pConv))                     to iLen
+        Move (ResizeArray(ucaData, iLen))               to ucaData
+        Move (MemCopy(AddressOf(ucaData), pConv, iLen)) to bOK
+        Move (Free(pConv))                              to bWorked
+        
+        If bOK Begin
+            // Get the data into a JSON object
+            Get Create (RefClass(cJsonObject))  to hoJson
+            Set pbRequireAllMembers of hoJson   to False
+            
+            Get ParseUtf8 of hoJson ucaData     to bOk
+            
+            If bOK Begin
+                Function_Return hoJson
+            End
+            Else Begin
+                Function_Return (JsonError(Self, C_restDataParseError, "Parse error", psParseError(hoJson)))
+            End
+            
+        End
+        Else Begin
+            Function_Return (JsonError(Self, C_restDataError, "Error retrieving JSON data", ""))
+        End
+                            
+    End_Function
+    
+    // This is the entry-point for the ASP to call. It sets everything up then
+    // (all being well) returns a call to RouteCall.
+    Function ProcessCall Address pData Integer iLength Returns Variant
+        Handle   hoJson
+        Boolean  bOK
+        Integer  i iMax
+        String   sVerb sRequest
+        String[] asInfo asParams asValues asParam empty
+        tErrorResponse tErr
+        tRestError[] emptyErrs
+        
+        // Be tidy, although it should never be non-zero
+        Get phoJsonData to hoJson
+        
+        If hoJson Begin
+            Send Destroy of hoJson
+            Set phoJsonData to 0
+        End
+        
+        If (pbDFErrsToJson(Self)) Begin  // Recommended
+            Send ErrorQueueStart
+        End
+        Else Begin
+            Set pbReportErrors to False  // Not recommended
+        End
+        
+        Get ServerVariable "REQUEST_METHOD"     to sVerb
+        Get ServerVariable "ORIGINAL_REQUEST"   to sRequest
+        
+        // Store various arguments in properties
+        Set paData          to pData
+        Set piDataLen       to iLength
+        Set psVerb          to (Uppercase(sVerb)) // AFAIK it is always uppercase anyway.
+        Set psRequest       to sRequest
+        
+        // Store the parts of the request in an array property
+        Set pasRequestParts to (ParseRequest(Self))
+        
+        Get BeforeProcessing (&tErr) to bOK
+        
+        If not bOK Begin
+            Function_Return (ReturnJson(Self, &tErr))
+        End
+        
+        If (pData and iLength) Begin
+            // If there is a JSON body, retrieve it into a JSON object (property handle)
+            Move (ParseJson(Self, &bOK)) to hoJson
+            
+            If bOK Begin
+                Set phoJsonData to hoJson
+            End
+            Else Begin
+                
+                If hoJson Begin
+                    Get JsonToDataType of hoJson to tErr
+                    Send Destroy of hoJson
+                    Function_Return (ReturnJson(Self, tErr))
+                End
+                Else Begin  // Can't see how this could happen, but care in all things!
+                    Function_Return (ReturnError(Self, C_restDataParseError, ;
+                                                       "Unable to parse JSON content", ""))
+                End
+                
+            End
+            
+        End
+        
+        Function_Return (RouteCall(Self))
+    End_Function
+    
+    Procedure End_Construct_Object
+        // Register the ProcessCall function so ASP can call it.
+        Send RegisterInterface get_ProcessCall ;
+            "get_ProcessCall" ;
+            "Address pData Integer iLength Returns Variant" ;
+            "Entry point for RESTful web service"
+        Forward Send End_Construct_Object
+    End_Procedure
+    
+End_Class
