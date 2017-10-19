@@ -1,0 +1,36 @@
+Use DFAllEnt.pkg
+Use cCJStandardCommandBarSystem.pkg
+
+Object oHtmlHelp is a cHtmlHelp
+End_Object
+
+Object oApplication is a cApplication
+    Set peHelpType to htHtmlHelp
+
+    Object oConnection is a cConnection
+        Use LoginEncryption.pkg
+        Use DatabaseLoginDialog.dg
+    End_Object
+
+End_Object
+
+Object oToolTipController is a cToolTipController
+    Move Self to ghoToolTipController
+End_Object
+
+Use oEditContextMenu.pkg
+Use oDEOEditContextMenu17.pkg
+
+Object oMain is a Panel
+    Set Label To "RESTful Contacts Service Test Program"
+    Set Location to 4 3
+    Set Size to 300 450
+
+    Object oClientArea is a ClientArea
+        Use Tester.vw
+    End_Object
+
+End_Object
+
+Send Activate_oTester of (oClientArea(oMain))
+Start_UI

@@ -1,0 +1,80 @@
+Use cHttpTransfer.pkg
+
+Class cRESTHttpTransfer is a cHttpTransfer
+    
+    Procedure Construct_Object
+        Boolean bOK
+        
+        Forward Send Construct_Object
+        
+        Property UChar[] pucaData
+        Property String  psContentType
+        Property String  psCallPath
+    End_Procedure
+    
+    Procedure OnDataReceived String sContentType String sData
+        UChar[] ucaData
+        
+        Get pucaData        to ucaData
+        Set pucaData        to (AppendArray(ucaData, StringToUCharArray(sData)))
+        Set psContentType   to sContentType
+    End_Procedure
+    
+    Function MakeCall String sVerb String sCall Variant vData Boolean bHasData Returns Handle
+        Integer iOK iLen iStatus
+        Boolean bOK
+        String  sErr
+        Address pData
+        Handle  hoReq hoResp
+        UChar[] ucaReq ucaResp
+        
+        If (bHasData) Begin
+            Get Create (RefClass(cJsonObject))  to hoReq
+            Send DataTypeToJson of hoReq vData
+            Get StringifyUtf8   of hoReq        to ucaReq
+            Send Destroy        of hoReq
+            Move (AddressOf(ucaReq))            to pData
+            Move (SizeOfArray(ucaReq))          to iLen
+        End
+        Else Begin
+            Move 0 to pData
+            Move 0 to iLen
+        End
+        
+        Get HttpVerbAddrRequest (psCallPath(Self) + sCall) pData iLen False sVerb to iOK
+        
+        If iOK Begin
+            Get ResponseStatusCode to iStatus
+            
+            If ((iStatus >= 200) and (iStatus < 300)) Begin
+                Get pucaData to ucaResp
+                
+                String sTest
+                Move (UCharArrayToString(ucaResp)) to sTest
+                Get Create of Desktop (RefClass(cJsonObject)) to hoResp
+                Get ParseUtf8 of hoResp ucaResp to bOK
+                 
+                If bOK Begin
+                    Set pbRequireAllMembers of hoResp to False
+                    Function_Return hoResp
+                End
+                Else Begin
+                    Get psParseError of hoResp to sErr
+                    Error 999 ("JSON parse error:" * sErr)
+                End
+                
+                Send Destroy of hoResp
+            End
+            Else Begin
+                Error 998 ("HTTP Error:" * String(iStatus))
+            End
+            
+        End
+        Else Begin
+            Error 997 ("HTTP" * sVerb * "request failed")
+        End
+        
+        Function_Return 0
+    End_Function
+    
+End_Class
